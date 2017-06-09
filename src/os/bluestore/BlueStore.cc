@@ -3823,7 +3823,11 @@ int BlueStore::_check_or_set_bdev_label(
     int r = _read_bdev_label(cct, path, &label);
     if (r < 0)
       return r;
-    if (label.osd_uuid != fsid) {
+    if (cct->_conf->bluestore_debug_permit_any_bdev_label) {
+      dout(20) << __func__ << " bdev " << path << " fsid " << label.osd_uuid
+	   << " and fsid " << fsid << " check bypassed" << dendl;
+    }
+    else if (label.osd_uuid != fsid) {
       derr << __func__ << " bdev " << path << " fsid " << label.osd_uuid
 	   << " does not match our fsid " << fsid << dendl;
       return -EIO;
@@ -4134,6 +4138,38 @@ int BlueStore::_lock_fsid()
     return -err;
   }
   return 0;
+}
+
+bool BlueStore::is_rotational()
+{
+  if (bdev) {
+    return bdev->is_rotational();
+  }
+
+  bool rotational = true;
+  int r = _open_path();
+  if (r < 0)
+    goto out;
+  r = _open_fsid(false);
+  if (r < 0)
+    goto out_path;
+  r = _read_fsid(&fsid);
+  if (r < 0)
+    goto out_fsid;
+  r = _lock_fsid();
+  if (r < 0)
+    goto out_fsid;
+  r = _open_bdev(false);
+  if (r < 0)
+    goto out_fsid;
+  rotational = bdev->is_rotational();
+  _close_bdev();
+ out_fsid:
+  _close_fsid();
+ out_path:
+  _close_path();
+  out:
+  return rotational;
 }
 
 bool BlueStore::test_mount_in_use()
@@ -4644,6 +4680,24 @@ int BlueStore::_open_collections(int *errors)
     }
   }
   return 0;
+}
+
+void BlueStore::open_statfs()
+{
+  bufferlist bl;
+  int r = db->get(PREFIX_STAT, "bluestore_statfs", &bl);
+  if (r >= 0) {
+    if (size_t(bl.length()) >= sizeof(vstatfs.values)) {
+      auto it = bl.begin();
+      vstatfs.decode(it);
+    }
+    else {
+      dout(10) << __func__ << " store_statfs is corrupt, using empty" << dendl;
+    }
+  }
+  else {
+    dout(10) << __func__ << " store_statfs missed, using empty" << dendl;
+  }
 }
 
 int BlueStore::_setup_block_symlink_or_file(
@@ -5760,26 +5814,15 @@ int BlueStore::statfs(struct store_statfs_t *buf)
     }
   }
 
-  bufferlist bl;
-  int r = db->get(PREFIX_STAT, "bluestore_statfs", &bl);
-  if (r >= 0) {
-       TransContext::volatile_statfs vstatfs;
-     if (size_t(bl.length()) >= sizeof(vstatfs.values)) {
-       auto it = bl.begin();
-       vstatfs.decode(it);
-
-       buf->allocated = vstatfs.allocated();
-       buf->stored = vstatfs.stored();
-       buf->compressed = vstatfs.compressed();
-       buf->compressed_original = vstatfs.compressed_original();
-       buf->compressed_allocated = vstatfs.compressed_allocated();
-     } else {
-       dout(10) << __func__ << " store_statfs is corrupt, using empty" << dendl;
-     }
-  } else {
-    dout(10) << __func__ << " store_statfs missed, using empty" << dendl;
+  {
+    std::lock_guard<std::mutex> l(vstatfs_lock);
+    
+    buf->allocated = vstatfs.allocated();
+    buf->stored = vstatfs.stored();
+    buf->compressed = vstatfs.compressed();
+    buf->compressed_original = vstatfs.compressed_original();
+    buf->compressed_allocated = vstatfs.compressed_allocated();
   }
-
 
   dout(20) << __func__ << *buf << dendl;
   return 0;
@@ -7338,6 +7381,7 @@ int BlueStore::_open_super_meta()
     dout(10) << __func__ << " min_alloc_size 0x" << std::hex << min_alloc_size
 	     << std::dec << dendl;
   }
+  open_statfs();
   _set_alloc_sizes();
   _set_throttle_params();
 
@@ -7451,6 +7495,11 @@ void BlueStore::_txc_update_store_statfs(TransContext *txc)
   logger->inc(l_bluestore_compressed_allocated, txc->statfs_delta.compressed_allocated());
   logger->inc(l_bluestore_compressed_original, txc->statfs_delta.compressed_original());
 
+  {
+    std::lock_guard<std::mutex> l(vstatfs_lock);
+    vstatfs += txc->statfs_delta;
+  }
+
   bufferlist bl;
   txc->statfs_delta.encode(bl);
 
@@ -7509,7 +7558,7 @@ void BlueStore::_txc_state_proc(TransContext *txc)
 		   << dendl;
 	} else {
 	  txc->state = TransContext::STATE_KV_SUBMITTED;
-	  int r = db->submit_transaction(txc->t);
+	  int r = cct->_conf->bluestore_debug_omit_kv_commit ? 0 : db->submit_transaction(txc->t);
 	  assert(r == 0);
 	  _txc_applied_kv(txc);
 	}
@@ -8113,7 +8162,7 @@ void BlueStore::_kv_sync_thread()
       for (auto txc : kv_submitting) {
 	assert(txc->state == TransContext::STATE_KV_QUEUED);
 	txc->log_state_latency(logger, l_bluestore_state_kv_queued_lat);
-	int r = db->submit_transaction(txc->t);
+	int r = cct->_conf->bluestore_debug_omit_kv_commit ? 0 : db->submit_transaction(txc->t);
 	assert(r == 0);
 	_txc_applied_kv(txc);
 	--txc->osr->kv_committing_serially;
@@ -8179,7 +8228,7 @@ void BlueStore::_kv_sync_thread()
       }
 
       // submit synct synchronously (block and wait for it to commit)
-      int r = db->submit_transaction_sync(synct);
+      int r = cct->_conf->bluestore_debug_omit_kv_commit ? 0 : db->submit_transaction_sync(synct);
       assert(r == 0);
 
       if (new_nid_max) {
@@ -8286,6 +8335,7 @@ void BlueStore::_kv_finalize_thread()
 	_txc_state_proc(txc);
 	kv_committed.pop_front();
       }
+
       for (auto b : deferred_stable) {
 	auto p = b->txcs.begin();
 	while (p != b->txcs.end()) {
